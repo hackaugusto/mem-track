@@ -14,11 +14,13 @@ use std::{
     thread::{self, ThreadId},
 };
 
+use crossbeam_utils::CachePadded;
+
 // Type description:
 // - RwLock: To synchronize collecting the data and updating it.
 // - Vec: Each entry corresponds to one thread state.
 // - BytesInUse: The actual metrics.
-type SharedData = RwLock<Vec<BytesInUse>>;
+type SharedData = RwLock<Vec<CachePadded<BytesInUse>>>;
 
 // Type description:
 // - LazyLock: Used to wrap a `SharedDAta` and expose it as a static.
@@ -63,7 +65,7 @@ impl Drop for StateGuard {
     }
 }
 
-fn init_bytes() -> RwLockReadGuard<'static, Vec<BytesInUse>> {
+fn init_bytes() -> RwLockReadGuard<'static, Vec<CachePadded<BytesInUse>>> {
     loop {
         let pos = CACHED_POSITION.get();
         {
@@ -90,7 +92,7 @@ fn init_bytes() -> RwLockReadGuard<'static, Vec<BytesInUse>> {
             };
             let pos = lock.len();
             CACHED_POSITION.set(pos);
-            lock.push(bytes);
+            lock.push(CachePadded::new(bytes));
         }
     }
 }
@@ -115,7 +117,7 @@ pub fn global_peak() -> usize {
 ///
 /// This operation cleans the vector to free up memory of exited threads, because the global allocator
 /// can not use thread local destructors.
-pub fn global_reset() -> Vec<BytesInUse> {
+pub fn global_reset() -> Vec<CachePadded<BytesInUse>> {
     let _guard = StateGuard::new();
 
     let empty = Vec::new();
@@ -218,7 +220,7 @@ impl<T> BytesInUseTracker<T> {
     }
 
     /// Resets the peak of all threads.
-    pub fn reset(&mut self) -> Vec<BytesInUse> {
+    pub fn reset(&mut self) -> Vec<CachePadded<BytesInUse>> {
         global_reset()
     }
 }

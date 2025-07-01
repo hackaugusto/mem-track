@@ -25,6 +25,7 @@ use crate::guard::StateGuard;
 type SharedData = Vec<CachePadded<Mutex<ThreadData>>>;
 
 type FlameGraph = BTreeMap<BacktraceId, AllocationSite>;
+type Metrics = Vec<(&'static Backtrace, usize)>;
 
 // Type description:
 // - LazyLock: Used to wrap a `Mutex<Vec<_>>` and expose it as a static.
@@ -82,12 +83,12 @@ pub struct BacktraceId(u64);
 
 /// Flame graph for the number of alloc calls.
 pub struct AllocCallsFlameGraph {
-    metrics: Vec<(&'static Backtrace, usize)>,
+    metrics: Metrics,
 }
 
 /// Flame graph for the number of bytes allocated.
 pub struct BytesAllocatedFlameGraph {
-    metrics: Vec<(&'static Backtrace, usize)>,
+    metrics: Metrics,
 }
 
 fn symbol_to_name(symbol: &BacktraceSymbol) -> Demangle {
@@ -188,88 +189,65 @@ impl AllocationSite {
     }
 }
 
-pub fn global_alloc_calls() -> AllocCallsFlameGraph {
-    let _guard = StateGuard::new();
+/// Extract global metric data to generate a flame graph.
+pub fn global_extract_flame_data<F>(extractor: F) -> Metrics
+where
+    F: Fn(&AllocationSite) -> usize,
+{
+    let result = {
+        let _guard = StateGuard::new();
 
-    let threads = THREADS
-        .read()
-        .expect("Should never panic while holding the lock");
+        let threads = THREADS
+            .read()
+            .expect("Should never panic while holding the lock");
 
-    let mut cache = BACKTRACE_CACHE
-        .lock()
-        .expect("Should never panic while holding the lock");
-
-    let mut result = BTreeMap::new();
-    for thread in threads.iter() {
-        let lock = thread
+        let mut cache = BACKTRACE_CACHE
             .lock()
             .expect("Should never panic while holding the lock");
 
-        for (key, value) in lock.flame.iter() {
-            let alloc_calls = value.alloc_calls.load(Ordering::Relaxed);
-            match result.entry(*key) {
-                Entry::Vacant(vacant_entry) => {
-                    cache.entry(*key).or_insert_with(|| {
-                        let mut backtrace = Box::new(value.backtrace.clone());
-                        backtrace.resolve();
-                        Box::leak(backtrace)
-                    });
-                    let backtrace_resolved = cache.get(key).expect("Initialised above");
+        let mut result = BTreeMap::new();
+        for thread in threads.iter() {
+            let lock = thread
+                .lock()
+                .expect("Should never panic while holding the lock");
 
-                    vacant_entry.insert((*backtrace_resolved, alloc_calls));
-                }
-                Entry::Occupied(occupied_entry) => {
-                    occupied_entry.into_mut().1 += alloc_calls;
-                }
-            };
+            for (key, value) in lock.flame.iter() {
+                let alloc_calls = extractor(value);
+                match result.entry(*key) {
+                    Entry::Vacant(vacant_entry) => {
+                        cache.entry(*key).or_insert_with(|| {
+                            let mut backtrace = Box::new(value.backtrace.clone());
+                            backtrace.resolve();
+                            Box::leak(backtrace)
+                        });
+                        let backtrace_resolved = cache.get(key).expect("Initialised above");
+
+                        vacant_entry.insert((*backtrace_resolved, alloc_calls));
+                    }
+                    Entry::Occupied(occupied_entry) => {
+                        occupied_entry.into_mut().1 += alloc_calls;
+                    }
+                };
+            }
         }
-    }
+        result
+    };
 
-    AllocCallsFlameGraph {
-        metrics: result.into_values().collect(),
-    }
+    result.into_values().collect()
 }
 
+/// Extract global metric data to generate a flame graph for the number of [GlobalAlloc::alloc] calls.
+pub fn global_alloc_calls() -> AllocCallsFlameGraph {
+    let metrics = global_extract_flame_data(|value| value.alloc_calls.load(Ordering::Relaxed));
+
+    AllocCallsFlameGraph { metrics }
+}
+
+/// Extract global metric data to generate a flame graph for the number of bytes allocated via the global allocator.
 pub fn global_bytes_allocated() -> BytesAllocatedFlameGraph {
-    let _guard = StateGuard::new();
+    let metrics = global_extract_flame_data(|value| value.bytes_allocated.load(Ordering::Relaxed));
 
-    let threads = THREADS
-        .read()
-        .expect("Should never panic while holding the lock");
-
-    let mut cache = BACKTRACE_CACHE
-        .lock()
-        .expect("Should never panic while holding the lock");
-
-    let mut result = BTreeMap::new();
-    for thread in threads.iter() {
-        let lock = thread
-            .lock()
-            .expect("Should never panic while holding the lock");
-
-        for (key, value) in lock.flame.iter() {
-            let bytes_allocated = value.bytes_allocated.load(Ordering::Relaxed);
-            match result.entry(*key) {
-                Entry::Vacant(vacant_entry) => {
-                    cache.entry(*key).or_insert_with(|| {
-                        let mut backtrace = Box::new(value.backtrace.clone());
-                        backtrace.resolve();
-                        Box::leak(backtrace)
-                    });
-                    let backtrace_resolved = cache.get(key).expect("Initialised above");
-
-                    vacant_entry.insert((*backtrace_resolved, bytes_allocated));
-                }
-                Entry::Occupied(occupied_entry) => {
-                    occupied_entry.into_mut().1 += bytes_allocated;
-                }
-            };
-        }
-    }
-
-    BytesAllocatedFlameGraph {
-        metrics: result.into_values().collect(),
-    }
+    BytesAllocatedFlameGraph { metrics }
 }
 
 pub struct FlameAlloc<T> {

@@ -4,10 +4,10 @@ use std::{
     time::Duration,
 };
 
-use mem_track::peak::{BytesInUseTracker, global_reset, thread_peak};
+use mem_track::flame::FlameAlloc;
 
 #[global_allocator]
-static ALLOCATOR: BytesInUseTracker<System> = BytesInUseTracker::init(System);
+static ALLOCATOR: FlameAlloc<System> = FlameAlloc::init(System);
 
 fn main() {
     let mut handles = Vec::new();
@@ -20,7 +20,6 @@ fn main() {
                     data.push(item);
                 }
 
-                println!("{id}: {} {}", thread_peak(), ALLOCATOR.peak());
                 sleep(Duration::from_millis(id * 300));
             }
         });
@@ -30,11 +29,10 @@ fn main() {
     let mut i = 0;
     loop {
         i += 1;
-        println!("global: {}", ALLOCATOR.peak());
         sleep(Duration::from_millis(1_000));
 
         if i % 10 == 1 {
-            global_reset();
+            println!("{}", ALLOCATOR.bytes_allocated());
         }
     }
 }

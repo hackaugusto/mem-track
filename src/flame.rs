@@ -1,103 +1,325 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
-    cell::OnceCell,
-    collections::BTreeMap,
+    cell::Cell,
+    collections::{BTreeMap, btree_map::Entry},
+    fmt::Display,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{
-        Arc, LazyLock, Mutex,
+        LazyLock, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicUsize, Ordering},
     },
+    thread::{self, ThreadId},
 };
 
-use backtrace::Backtrace;
+use backtrace::{Backtrace, BacktraceSymbol};
+use crossbeam_utils::CachePadded;
+use rustc_demangle::{Demangle, demangle};
+
+use crate::guard::StateGuard;
+
+// Type description:
+// - Vec: Each entry corresponds to one thread state.
+// - CachePadded: Pad the data to prevent false sharing.
+// - Mutex: to allow for interion mutation.
+// - ThreadData: the flame graph data.
+type SharedData = Vec<CachePadded<Mutex<ThreadData>>>;
+
+type FlameGraph = BTreeMap<BacktraceId, AllocationSite>;
 
 // Type description:
 // - LazyLock: Used to wrap a `Mutex<Vec<_>>` and expose it as a static.
-// - Mutex: Used to synchronize calls to `Vec<_>` by all threads.
-// - Vec: Each entry corresponds to one thread state.
-static THREADS: LazyLock<Mutex<Vec<SharedData>>> = LazyLock::new(|| Default::default());
+// - RwLock: To synchronize collecting the data and updating it.
+static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default());
 
-// Type description:
-// - Arc: Used to make the data send'able.
-// - Mutex: allow concurrent reads / writes.
-// - BTreeMap: the flame graph data.
-type SharedData = Arc<Mutex<BTreeMap<BacktraceId, AllocationSite>>>;
+static BACKTRACE_CACHE: LazyLock<Mutex<BTreeMap<BacktraceId, &'static Backtrace>>> =
+    LazyLock::new(|| Default::default());
 
+// NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
 thread_local! {
-    // OnceCell: Used to guarantee the `SharedData` is cloned to the `THREADS` static only once.
-    static ALLOCATION_SITES: OnceCell<SharedData> = OnceCell::new();
+    // Cache for the position of allocation map in the global array.
+    static CACHED_POSITION: Cell<usize> = Cell::new(0);
 }
 
-fn init_btree(once: &OnceCell<SharedData>) -> &SharedData {
-    once.get_or_init(|| {
-        let map = Arc::new(Mutex::new(BTreeMap::default()));
-        let mut threads = THREADS
-            .lock()
-            .expect("Should never panic while holding the lock");
-        threads.push(map.clone());
-        map
-    })
+fn init_btree() -> RwLockReadGuard<'static, SharedData> {
+    loop {
+        let pos = CACHED_POSITION.get();
+        {
+            let lock = THREADS
+                .read()
+                .expect("Should never panic while holding the lock");
+
+            if let Some(data) = lock.get(pos) {
+                let thread_id = data
+                    .lock()
+                    .expect("Should never panic while holding the lock")
+                    .thread_id;
+
+                if thread_id == thread::current().id() {
+                    return lock;
+                }
+            }
+        }
+
+        {
+            let mut lock = THREADS
+                .write()
+                .expect("Should never panic while holding the lock");
+
+            let flame_graph = ThreadData {
+                flame: Default::default(),
+                thread_id: thread::current().id(),
+            };
+            let pos = lock.len();
+            CACHED_POSITION.set(pos);
+            lock.push(CachePadded::new(Mutex::new(flame_graph)));
+        }
+    }
 }
 
 /// A wrapper struct to uniquely identify an allocation size.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct BacktraceId(Vec<usize>);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BacktraceId(u64);
+
+/// Flame graph for the number of alloc calls.
+pub struct AllocCallsFlameGraph {
+    metrics: Vec<(&'static Backtrace, usize)>,
+}
+
+/// Flame graph for the number of bytes allocated.
+pub struct BytesAllocatedFlameGraph {
+    metrics: Vec<(&'static Backtrace, usize)>,
+}
+
+fn symbol_to_name(symbol: &BacktraceSymbol) -> Demangle {
+    let name = symbol.name().map(|n| n.as_str()).flatten().unwrap_or("");
+    demangle(name)
+}
+
+/// Format a single entry in a flame graph.
+fn format_entry(
+    f: &mut std::fmt::Formatter<'_>,
+    backtrace: &'static Backtrace,
+    metric: usize,
+) -> std::fmt::Result {
+    for frame in backtrace.frames().iter().rev() {
+        let mut symbols = frame.symbols().iter();
+
+        if let Some(symbol) = symbols.next() {
+            f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
+        }
+
+        for symbol in symbols {
+            f.write_str(";")?;
+            f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
+        }
+    }
+    f.write_str(" ")?;
+    f.write_fmt(format_args!("{}", metric))
+}
+
+/// Format a flame graph document.
+fn format_flame_graph(
+    data: &[(&'static Backtrace, usize)],
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    let mut iter = data.iter();
+    let last = iter.next_back();
+    for (backtrace, metric) in data {
+        format_entry(f, backtrace, *metric)?;
+        f.write_str("\n")?;
+    }
+    if let Some((backtrace, metric)) = last {
+        format_entry(f, backtrace, *metric)?;
+    }
+
+    Ok(())
+}
+
+impl Display for AllocCallsFlameGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_flame_graph(&self.metrics, f)
+    }
+}
+
+impl Display for BytesAllocatedFlameGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_flame_graph(&self.metrics, f)
+    }
+}
+
+struct ThreadData {
+    /// Tracks each individual allocation size
+    flame: FlameGraph,
+
+    /// The thread to which this data corresponds to.
+    thread_id: ThreadId,
+}
 
 impl From<&Backtrace> for BacktraceId {
     fn from(value: &Backtrace) -> Self {
-        let instruction_pointers = value
-            .frames()
-            .iter()
-            .map(|frame| frame.ip() as usize)
-            .collect();
-        BacktraceId(instruction_pointers)
+        let mut hasher = DefaultHasher::new();
+        for frame in value.frames().iter() {
+            hasher.write_u64(frame.ip() as u64)
+        }
+        BacktraceId(hasher.finish())
     }
 }
 
 #[derive(Debug)]
-struct AllocationSite {
+pub struct AllocationSite {
     /// Number of allocations done at this call site.
     alloc_calls: AtomicUsize,
 
     /// Number of bytes allocated at this call site.
-    allocated: AtomicUsize,
+    bytes_allocated: AtomicUsize,
 
     /// The corresponding [Backtrace] for this site.
     backtrace: Backtrace,
 }
+
 impl AllocationSite {
+    /// Creates a new [AllocationSite] with the given [Backtrace].
     fn with_backtrace(backtrace: Backtrace) -> AllocationSite {
         AllocationSite {
             alloc_calls: AtomicUsize::default(),
-            allocated: AtomicUsize::default(),
+            bytes_allocated: AtomicUsize::default(),
             backtrace,
         }
     }
 }
 
-struct FlameAlloc<T> {
+pub fn global_alloc_calls() -> AllocCallsFlameGraph {
+    let _guard = StateGuard::new();
+
+    let threads = THREADS
+        .read()
+        .expect("Should never panic while holding the lock");
+
+    let mut cache = BACKTRACE_CACHE
+        .lock()
+        .expect("Should never panic while holding the lock");
+
+    let mut result = BTreeMap::new();
+    for thread in threads.iter() {
+        let lock = thread
+            .lock()
+            .expect("Should never panic while holding the lock");
+
+        for (key, value) in lock.flame.iter() {
+            let alloc_calls = value.alloc_calls.load(Ordering::Relaxed);
+            match result.entry(*key) {
+                Entry::Vacant(vacant_entry) => {
+                    cache.entry(*key).or_insert_with(|| {
+                        let mut backtrace = Box::new(value.backtrace.clone());
+                        backtrace.resolve();
+                        Box::leak(backtrace)
+                    });
+                    let backtrace_resolved = cache.get(key).expect("Initialised above");
+
+                    vacant_entry.insert((*backtrace_resolved, alloc_calls));
+                }
+                Entry::Occupied(occupied_entry) => {
+                    occupied_entry.into_mut().1 += alloc_calls;
+                }
+            };
+        }
+    }
+
+    AllocCallsFlameGraph {
+        metrics: result.into_values().collect(),
+    }
+}
+
+pub fn global_bytes_allocated() -> BytesAllocatedFlameGraph {
+    let _guard = StateGuard::new();
+
+    let threads = THREADS
+        .read()
+        .expect("Should never panic while holding the lock");
+
+    let mut cache = BACKTRACE_CACHE
+        .lock()
+        .expect("Should never panic while holding the lock");
+
+    let mut result = BTreeMap::new();
+    for thread in threads.iter() {
+        let lock = thread
+            .lock()
+            .expect("Should never panic while holding the lock");
+
+        for (key, value) in lock.flame.iter() {
+            let bytes_allocated = value.bytes_allocated.load(Ordering::Relaxed);
+            match result.entry(*key) {
+                Entry::Vacant(vacant_entry) => {
+                    cache.entry(*key).or_insert_with(|| {
+                        let mut backtrace = Box::new(value.backtrace.clone());
+                        backtrace.resolve();
+                        Box::leak(backtrace)
+                    });
+                    let backtrace_resolved = cache.get(key).expect("Initialised above");
+
+                    vacant_entry.insert((*backtrace_resolved, bytes_allocated));
+                }
+                Entry::Occupied(occupied_entry) => {
+                    occupied_entry.into_mut().1 += bytes_allocated;
+                }
+            };
+        }
+    }
+
+    BytesAllocatedFlameGraph {
+        metrics: result.into_values().collect(),
+    }
+}
+
+pub struct FlameAlloc<T> {
     inner: T,
+}
+
+impl<T> FlameAlloc<T> {
+    /// Creates a new allocator.
+    pub const fn init(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// Returns a reference to the wrapped allocator.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Returns the data for number of alloc calls.
+    pub fn alloc_calls(&self) -> AllocCallsFlameGraph {
+        global_alloc_calls()
+    }
+
+    /// Returns the data for number of bytes allocated.
+    pub fn bytes_allocated(&self) -> BytesAllocatedFlameGraph {
+        global_bytes_allocated()
+    }
 }
 
 unsafe impl<T: GlobalAlloc> GlobalAlloc for FlameAlloc<T> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ret = unsafe { self.inner.alloc(layout) };
         if !ret.is_null() {
-            let backtrace = Backtrace::new_unresolved();
-            let id = BacktraceId::from(&backtrace);
+            if let Some(_guard) = StateGuard::track() {
+                let backtrace = Backtrace::new_unresolved();
+                let id = BacktraceId::from(&backtrace);
 
-            ALLOCATION_SITES.with(|once| {
-                let mut tree = init_btree(once)
+                let lock = init_btree();
+                let mut flame_graph = lock[CACHED_POSITION.get()]
                     .lock()
                     .expect("Should never panic while holding the lock");
 
-                let allocation_site = tree
+                let allocation_site = flame_graph
+                    .flame
                     .entry(id)
                     .or_insert(AllocationSite::with_backtrace(backtrace));
                 allocation_site.alloc_calls.fetch_add(1, Ordering::Relaxed);
                 allocation_site
-                    .allocated
+                    .bytes_allocated
                     .fetch_add(layout.size(), Ordering::Relaxed);
-            })
+            }
         }
         ret
     }

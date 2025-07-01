@@ -16,56 +16,26 @@ use std::{
 
 use crossbeam_utils::CachePadded;
 
+use crate::guard::StateGuard;
+
 // Type description:
-// - RwLock: To synchronize collecting the data and updating it.
 // - Vec: Each entry corresponds to one thread state.
+// - CachePadded: Pad the data to prevent false sharing.
 // - BytesInUse: The actual metrics.
-type SharedData = RwLock<Vec<CachePadded<BytesInUse>>>;
+type SharedData = Vec<CachePadded<BytesInUse>>;
 
 // Type description:
 // - LazyLock: Used to wrap a `SharedDAta` and expose it as a static.
-static THREADS: LazyLock<SharedData> = LazyLock::new(|| Default::default());
-
-/// Tracking must be disabled when running the tracker code itself.
-///
-/// This is because tracking the tracker would cause infinite recursion or cause
-/// deadlock when changing the underlying containers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum State {
-    CanTrack = 0,
-    MustNotTrack = 1,
-}
+// - RwLock: To synchronize collecting the data and updating it.
+static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default());
 
 // NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
 thread_local! {
     // Cache for the position of [BytesInUse] in the global array.
     static CACHED_POSITION: Cell<usize> = Cell::new(0);
-
-    // True if inside the allocator code, disable tracing to prevent infinite recursion.
-    static STATE: Cell<State> = Cell::new(State::CanTrack);
 }
 
-/// Must be used for all public APIs (include the allocator itself).
-///
-/// This prevents dead locks and infinite recursion by forbidding running the tracking code multiple times.
-struct StateGuard {
-    old: State,
-}
-
-impl StateGuard {
-    fn new() -> Self {
-        let old = STATE.replace(State::MustNotTrack);
-        Self { old }
-    }
-}
-
-impl Drop for StateGuard {
-    fn drop(&mut self) {
-        STATE.set(self.old);
-    }
-}
-
-fn init_bytes() -> RwLockReadGuard<'static, Vec<CachePadded<BytesInUse>>> {
+fn init_bytes() -> RwLockReadGuard<'static, SharedData> {
     loop {
         let pos = CACHED_POSITION.get();
         {
@@ -117,7 +87,7 @@ pub fn global_peak() -> usize {
 ///
 /// This operation cleans the vector to free up memory of exited threads, because the global allocator
 /// can not use thread local destructors.
-pub fn global_reset() -> Vec<CachePadded<BytesInUse>> {
+pub fn global_reset() -> SharedData {
     let _guard = StateGuard::new();
 
     let empty = Vec::new();
@@ -144,29 +114,6 @@ pub fn thread_reset_peak() {
     let in_use = bytes.in_use.load(Ordering::Relaxed);
     let in_use = usize::try_from(in_use).unwrap_or(0);
     bytes.peak.store(in_use, Ordering::Relaxed);
-}
-
-/// Trace a memory allocation.
-fn thread_alloc(size: usize) {
-    let size = size.try_into().expect("allocation should fit in a isize");
-
-    let lock = init_bytes();
-    let bytes = &lock[CACHED_POSITION.get()];
-
-    let old_allocated = bytes.in_use.fetch_add(size, Ordering::Relaxed);
-    // It's okay to add without synchronization because this thread is the only one changing the value
-    let new_allocated = usize::try_from(old_allocated + size).unwrap_or(0);
-    bytes.peak.fetch_max(new_allocated, Ordering::Relaxed);
-}
-
-/// Trace a memory de-allocation.
-fn thread_dealloc(size: usize) {
-    let size = size.try_into().expect("allocation should fit in a isize");
-
-    let lock = init_bytes();
-    let bytes = &lock[CACHED_POSITION.get()];
-
-    bytes.in_use.fetch_sub(size, Ordering::Relaxed);
 }
 
 pub struct BytesInUse {
@@ -220,7 +167,7 @@ impl<T> BytesInUseTracker<T> {
     }
 
     /// Resets the peak of all threads.
-    pub fn reset(&mut self) -> Vec<CachePadded<BytesInUse>> {
+    pub fn reset(&mut self) -> SharedData {
         global_reset()
     }
 }
@@ -229,9 +176,21 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ret = unsafe { self.inner.alloc(layout) };
 
-        if !ret.is_null() && STATE.get() == State::CanTrack {
-            let _guard = StateGuard::new();
-            thread_alloc(layout.size());
+        if !ret.is_null() {
+            if let Some(_guard) = StateGuard::track() {
+                let size = layout
+                    .size()
+                    .try_into()
+                    .expect("allocation should fit in a isize");
+
+                let lock = init_bytes();
+                let bytes = &lock[CACHED_POSITION.get()];
+
+                let old_allocated = bytes.in_use.fetch_add(size, Ordering::Relaxed);
+                // It's okay to add without synchronization because this thread is the only one changing the value
+                let new_allocated = usize::try_from(old_allocated + size).unwrap_or(0);
+                bytes.peak.fetch_max(new_allocated, Ordering::Relaxed);
+            }
         }
         ret
     }
@@ -240,9 +199,16 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
         unsafe {
             self.inner.dealloc(ptr, layout);
         }
-        if STATE.get() == State::CanTrack {
-            let _guard = StateGuard::new();
-            thread_dealloc(layout.size());
+        if let Some(_guard) = StateGuard::track() {
+            let size = layout
+                .size()
+                .try_into()
+                .expect("allocation should fit in a isize");
+
+            let lock = init_bytes();
+            let bytes = &lock[CACHED_POSITION.get()];
+
+            bytes.in_use.fetch_sub(size, Ordering::Relaxed);
         }
     }
 }

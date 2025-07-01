@@ -1,0 +1,12 @@
+[package]
+name = "mem-track"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+backtrace = "0.3.75"
+crossbeam-utils = "0.8.21"
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"

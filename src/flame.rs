@@ -4,6 +4,8 @@ use std::{
     collections::{BTreeMap, btree_map::Entry},
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
+    mem,
+    ops::DerefMut,
     sync::{
         LazyLock, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicUsize, Ordering},
@@ -190,23 +192,17 @@ impl AllocationSite {
 }
 
 /// Extract global metric data to generate a flame graph.
-pub fn global_extract_flame_data<F>(extractor: F) -> Metrics
+fn global_extract_flame_data<F>(data: &[CachePadded<Mutex<ThreadData>>], extractor: F) -> Metrics
 where
     F: Fn(&AllocationSite) -> usize,
 {
     let result = {
-        let _guard = StateGuard::new();
-
-        let threads = THREADS
-            .read()
-            .expect("Should never panic while holding the lock");
-
         let mut cache = BACKTRACE_CACHE
             .lock()
             .expect("Should never panic while holding the lock");
 
         let mut result = BTreeMap::new();
-        for thread in threads.iter() {
+        for thread in data.iter() {
             let lock = thread
                 .lock()
                 .expect("Should never panic while holding the lock");
@@ -238,16 +234,53 @@ where
 
 /// Extract global metric data to generate a flame graph for the number of [GlobalAlloc::alloc] calls.
 pub fn global_alloc_calls() -> AllocCallsFlameGraph {
-    let metrics = global_extract_flame_data(|value| value.alloc_calls.load(Ordering::Relaxed));
+    let _guard = StateGuard::new();
+
+    let threads = THREADS
+        .read()
+        .expect("Should never panic while holding the lock");
+    let metrics =
+        global_extract_flame_data(&threads, |value| value.alloc_calls.load(Ordering::Relaxed));
 
     AllocCallsFlameGraph { metrics }
 }
 
 /// Extract global metric data to generate a flame graph for the number of bytes allocated via the global allocator.
 pub fn global_bytes_allocated() -> BytesAllocatedFlameGraph {
-    let metrics = global_extract_flame_data(|value| value.bytes_allocated.load(Ordering::Relaxed));
+    let _guard = StateGuard::new();
+
+    let threads = THREADS
+        .read()
+        .expect("Should never panic while holding the lock");
+    let metrics = global_extract_flame_data(&threads, |value| {
+        value.bytes_allocated.load(Ordering::Relaxed)
+    });
 
     BytesAllocatedFlameGraph { metrics }
+}
+
+/// Extract global metric data to generate a flame graph for the number of [GlobalAlloc::alloc] calls.
+pub fn global_reset() -> (AllocCallsFlameGraph, BytesAllocatedFlameGraph) {
+    let _guard = StateGuard::new();
+
+    let threads = {
+        let empty = Vec::new();
+        let mut threads = THREADS
+            .write()
+            .expect("Should never panic while holding the lock");
+        mem::replace(threads.as_mut(), empty)
+    };
+
+    let metrics =
+        global_extract_flame_data(&threads, |value| value.alloc_calls.load(Ordering::Relaxed));
+    let alloc_calls = AllocCallsFlameGraph { metrics };
+
+    let metrics = global_extract_flame_data(&threads, |value| {
+        value.bytes_allocated.load(Ordering::Relaxed)
+    });
+    let bytes_allocated = BytesAllocatedFlameGraph { metrics };
+
+    (alloc_calls, bytes_allocated)
 }
 
 pub struct FlameAlloc<T> {
@@ -273,6 +306,20 @@ impl<T> FlameAlloc<T> {
     /// Returns the data for number of bytes allocated.
     pub fn bytes_allocated(&self) -> BytesAllocatedFlameGraph {
         global_bytes_allocated()
+    }
+
+    /// Reset the flame graph data and return the corresponding graphs.
+    pub fn global_reset(&self) -> (AllocCallsFlameGraph, BytesAllocatedFlameGraph) {
+        global_reset()
+    }
+
+    /// Empties the cache of resolved backtraces.
+    pub fn empty_backtrace_cache(&self) {
+        let empty = Default::default();
+        let mut cache = BACKTRACE_CACHE
+            .lock()
+            .expect("Should never panic while holding the lock");
+        let _ = mem::replace(cache.deref_mut(), empty);
     }
 }
 

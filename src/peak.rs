@@ -121,12 +121,12 @@ pub struct BytesInUse {
     ///
     /// Will be lower than peak after a deallocation.
     /// May be negative when a type is Send and deallocated on a different thread.
-    in_use: AtomicIsize,
+    pub in_use: AtomicIsize,
 
     /// Current high water mark.
     ///
     /// Can be re-set.
-    peak: AtomicUsize,
+    pub peak: AtomicUsize,
 
     /// The thread to which this data corresponds to.
     thread_id: ThreadId,

@@ -220,10 +220,8 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
                 let thread_data = init_thread_data();
 
                 let size = layout.size();
-                let old_allocated = thread_data.allocated.fetch_add(size, Ordering::Relaxed);
-                // It's okay to add without synchronization because this thread is the only one changing the value
-                let new_allocated = usize::try_from(old_allocated + size).unwrap_or(0);
-                thread_data.peak.fetch_max(new_allocated, Ordering::Relaxed);
+                thread_data.allocated.fetch_add(size, Ordering::Relaxed);
+                thread_data.peak.fetch_add(size, Ordering::Relaxed);
                 thread_data.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -237,9 +235,9 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
         if let Some(_guard) = StateGuard::track() {
             let thread_data = init_thread_data();
 
-            thread_data
-                .deallocated
-                .fetch_add(layout.size(), Ordering::Relaxed);
+            let size = layout.size();
+            thread_data.deallocated.fetch_add(size, Ordering::Relaxed);
+            thread_data.peak.fetch_sub(size, Ordering::Relaxed);
         }
     }
 }

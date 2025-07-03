@@ -36,8 +36,6 @@ type SharedData = Vec<ThreadDataRef>;
 // - RwLock: To synchronize collecting the data and updating it.
 static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default());
 
-static GLOBAL_PEAK: AtomicUsize = AtomicUsize::new(0);
-
 // NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
 thread_local! {
     // Cache for the position of [BytesInUse] in the global array.
@@ -68,13 +66,11 @@ fn init_thread_data() -> ThreadDataRef {
     }
 }
 
-/// Returns the peak bytes usage for the whole program.
-pub fn global_peak() -> usize {
-    GLOBAL_PEAK.load(Ordering::Relaxed)
-}
-
-/// Resets the global peak.
-pub fn global_reset() {
+/// Computes the current in use memory globally
+///
+/// This does not take into account padding added by the underlying allocator,
+/// it only accounts for the memory requested and used by the application.
+pub fn global_in_use() -> usize {
     #[derive(Default)]
     struct Alloc {
         allocated: usize,
@@ -91,10 +87,15 @@ pub fn global_reset() {
         state
     });
 
-    let peak = alloc.allocated - alloc.deallocated;
-    GLOBAL_PEAK.store(peak, Ordering::Relaxed);
+    alloc.allocated - alloc.deallocated
 }
 
+/// Resets the thread peak to its current memory saturating to zero.
+///
+/// The saturation happens in case the thread deallocated more memory than it
+/// allocated, which happens when it receives ownership of objects allocated
+/// by other threads (i.e. Send objects). Because of the saturation this
+/// overestimates allocations and will result in over reporting in some cases.
 fn reset_peak(thread_data: ThreadDataRef) {
     let allocated = thread_data.allocated.load(Ordering::Relaxed);
     let deallocated = thread_data.deallocated.load(Ordering::Relaxed);
@@ -218,14 +219,8 @@ impl<T> BytesInUseTracker<T> {
         &mut self.inner
     }
 
-    /// Returns the peak bytes usage for the whole program.
-    pub fn peak(&self) -> usize {
-        global_peak()
-    }
-
-    /// Resets the global and of all threads peaks.
-    pub fn reset(&self) -> Vec<BytesInUse> {
-        global_reset();
+    /// Resets all threads peaks.
+    pub fn reset_all_threads(&self) -> Vec<BytesInUse> {
         reset_all_threads()
     }
 }
@@ -239,10 +234,13 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
                 let thread_data = init_thread_data();
 
                 let size = layout.size();
-                thread_data.allocated.fetch_add(size, Ordering::Relaxed);
-                thread_data.peak.fetch_add(size, Ordering::Relaxed);
+                let old = thread_data.allocated.fetch_add(size, Ordering::Relaxed);
                 thread_data.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
-                GLOBAL_PEAK.fetch_add(size, Ordering::Relaxed);
+
+                // It is okay to add without synchronization because this is the only
+                // thread modifying these values.
+                let in_use = old + size;
+                thread_data.peak.fetch_max(in_use, Ordering::Relaxed);
             }
         }
         ret
@@ -257,8 +255,6 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
 
             let size = layout.size();
             thread_data.deallocated.fetch_add(size, Ordering::Relaxed);
-            thread_data.peak.fetch_sub(size, Ordering::Relaxed);
-            GLOBAL_PEAK.fetch_sub(size, Ordering::Relaxed);
         }
     }
 }

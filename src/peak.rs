@@ -3,15 +3,17 @@
 /// This is very similar to jemalloc's `thread.peak.read` and `thread.peak.reset` control options. With
 /// the benefit of working with any of Rust's allocators, and the option of observing the data for all
 /// threads.
+///
+/// NOTE: For each thread created there will a small amount of memory allocated which is _never_ freed.
+/// The size of the allocation corresponds to one [CachePadded<BytesInUse>] structure.
 use std::{
     alloc::{GlobalAlloc, Layout},
     cell::Cell,
-    mem,
+    ops::Deref,
     sync::{
-        LazyLock, RwLock, RwLockReadGuard,
+        LazyLock, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
-    thread::{self, ThreadId},
 };
 
 use crossbeam_utils::CachePadded;
@@ -19,10 +21,15 @@ use crossbeam_utils::CachePadded;
 use crate::guard::StateGuard;
 
 // Type description:
-// - Vec: Each entry corresponds to one thread state.
+// - &'static: the metric data is a global
 // - CachePadded: Pad the data to prevent false sharing.
 // - BytesInUse: The actual metrics.
-type SharedData = Vec<CachePadded<BytesInUse>>;
+type ThreadDataRef = &'static CachePadded<ThreadData>;
+
+// Type description:
+// - Vec: Each entry corresponds to one thread state.
+// - ThreadData: A single thread metric data.
+type SharedData = Vec<ThreadDataRef>;
 
 // Type description:
 // - LazyLock: Used to wrap a `SharedData` and expose it as a static.
@@ -32,39 +39,29 @@ static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default
 // NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
 thread_local! {
     // Cache for the position of [BytesInUse] in the global array.
-    static CACHED_POSITION: Cell<usize> = Cell::new(0);
+    static CACHED_REF: Cell<Option<ThreadDataRef>> = Cell::new(None);
 }
 
-fn init_bytes() -> RwLockReadGuard<'static, SharedData> {
-    loop {
-        let pos = CACHED_POSITION.get();
-        {
-            let lock = THREADS
-                .read()
-                .expect("Should never panic while holding the lock");
-
-            if let Some(data) = lock.get(pos) {
-                if data.thread_id == thread::current().id() {
-                    return lock;
-                }
-            }
-        }
-
-        {
+fn init_thread_data() -> ThreadDataRef {
+    match CACHED_REF.get() {
+        Some(bytes) => bytes,
+        None => {
             let mut lock = THREADS
                 .write()
                 .expect("Should never panic while holding the lock");
 
-            let bytes = BytesInUse {
+            let bytes = ThreadData {
                 allocated: Default::default(),
                 deallocated: Default::default(),
                 peak: Default::default(),
                 num_alloc_calls: Default::default(),
-                thread_id: thread::current().id(),
             };
-            let pos = lock.len();
-            CACHED_POSITION.set(pos);
-            lock.push(CachePadded::new(bytes));
+            let bytes = Box::leak(Box::new(CachePadded::new(bytes)));
+            lock.push(bytes);
+
+            CACHED_REF.set(Some(bytes));
+
+            bytes
         }
     }
 }
@@ -80,6 +77,13 @@ pub fn global_peak() -> usize {
     threads.iter().map(|v| v.peak.load(Ordering::Relaxed)).sum()
 }
 
+fn reset_peak(thread_data: ThreadDataRef) {
+    let allocated = thread_data.allocated.load(Ordering::Relaxed);
+    let deallocated = thread_data.deallocated.load(Ordering::Relaxed);
+    let peak = allocated.saturating_sub(deallocated);
+    thread_data.peak.store(peak, Ordering::Relaxed);
+}
+
 /// Resets the peak for all threads.
 ///
 /// This function will take the existing metrics and reset the global vector. This will invalidate
@@ -89,37 +93,38 @@ pub fn global_peak() -> usize {
 ///
 /// This operation cleans the vector to free up memory of exited threads, because the global allocator
 /// can not use thread local destructors.
-pub fn global_reset() -> SharedData {
+pub fn global_reset() -> Vec<BytesInUse> {
     let _guard = StateGuard::new();
 
-    let empty = Vec::new();
-    let mut threads = THREADS
-        .write()
+    let threads = THREADS
+        .read()
         .expect("Should never panic while holding the lock");
-    mem::replace(threads.as_mut(), empty)
+    let mut results = Vec::with_capacity(threads.len());
+
+    for thread_data in threads.iter() {
+        results.push(BytesInUse::from((*thread_data).deref()));
+        reset_peak(thread_data);
+    }
+
+    results
 }
 
 /// Returns the peak of this thread.
 pub fn thread_peak() -> usize {
     let _guard = StateGuard::new();
 
-    let lock = init_bytes();
-    lock[CACHED_POSITION.get()].peak.load(Ordering::Relaxed)
+    init_thread_data().peak.load(Ordering::Relaxed)
 }
 
 /// Resets the peak of this thread.
 pub fn thread_reset_peak() {
     let _guard = StateGuard::new();
 
-    let lock = init_bytes();
-    let bytes = &lock[CACHED_POSITION.get()];
-    let allocated = bytes.allocated.load(Ordering::Relaxed);
-    let deallocated = bytes.deallocated.load(Ordering::Relaxed);
-    let peak = allocated.saturating_sub(deallocated);
-    bytes.peak.store(peak, Ordering::Relaxed);
+    let thread_data = init_thread_data();
+    reset_peak(thread_data)
 }
 
-pub struct BytesInUse {
+struct ThreadData {
     /// Current number of bytes allocated.
     ///
     /// Can be smaller than deallocated if the thread drops Send objects it did
@@ -139,9 +144,39 @@ pub struct BytesInUse {
 
     /// Number of alloc calls.
     pub num_alloc_calls: AtomicUsize,
+}
 
-    /// The thread to which this data corresponds to.
-    thread_id: ThreadId,
+pub struct BytesInUse {
+    /// Current number of bytes allocated.
+    ///
+    /// Can be smaller than deallocated if the thread drops Send objects it did
+    /// not allocate.
+    pub allocated: usize,
+
+    /// Current number of bytes deallocated.
+    ///
+    /// Can be greater than allocated if the thread drops Send objects it did
+    /// not allocate.
+    pub deallocated: usize,
+
+    /// Current high water mark.
+    ///
+    /// Can be re-set.
+    pub peak: usize,
+
+    /// Number of alloc calls.
+    pub num_alloc_calls: usize,
+}
+
+impl From<&ThreadData> for BytesInUse {
+    fn from(value: &ThreadData) -> Self {
+        BytesInUse {
+            allocated: value.allocated.load(Ordering::Relaxed),
+            deallocated: value.deallocated.load(Ordering::Relaxed),
+            peak: value.peak.load(Ordering::Relaxed),
+            num_alloc_calls: value.num_alloc_calls.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// A high water mark allocator tracking bytes in use.
@@ -179,7 +214,7 @@ impl<T> BytesInUseTracker<T> {
     }
 
     /// Resets the peak of all threads.
-    pub fn reset(&self) -> SharedData {
+    pub fn reset(&self) -> Vec<BytesInUse> {
         global_reset()
     }
 }
@@ -190,15 +225,14 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
 
         if !ret.is_null() {
             if let Some(_guard) = StateGuard::track() {
-                let lock = init_bytes();
-                let bytes = &lock[CACHED_POSITION.get()];
+                let thread_data = init_thread_data();
 
                 let size = layout.size();
-                let old_allocated = bytes.allocated.fetch_add(size, Ordering::Relaxed);
+                let old_allocated = thread_data.allocated.fetch_add(size, Ordering::Relaxed);
                 // It's okay to add without synchronization because this thread is the only one changing the value
                 let new_allocated = usize::try_from(old_allocated + size).unwrap_or(0);
-                bytes.peak.fetch_max(new_allocated, Ordering::Relaxed);
-                bytes.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
+                thread_data.peak.fetch_max(new_allocated, Ordering::Relaxed);
+                thread_data.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
             }
         }
         ret
@@ -209,10 +243,9 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
             self.inner.dealloc(ptr, layout);
         }
         if let Some(_guard) = StateGuard::track() {
-            let lock = init_bytes();
-            let bytes = &lock[CACHED_POSITION.get()];
+            let thread_data = init_thread_data();
 
-            bytes
+            thread_data
                 .deallocated
                 .fetch_add(layout.size(), Ordering::Relaxed);
         }

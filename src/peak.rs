@@ -85,14 +85,6 @@ fn reset_peak(thread_data: ThreadDataRef) {
 }
 
 /// Resets the peak for all threads.
-///
-/// This function will take the existing metrics and reset the global vector. This will invalidate
-/// the cached position of all threads and result in re-allocation of all the metrics. After this
-/// initial contention the position cache will be hydrated and valid and contention should be back to
-/// a minimum.
-///
-/// This operation cleans the vector to free up memory of exited threads, because the global allocator
-/// can not use thread local destructors.
 pub fn global_reset() -> Vec<BytesInUse> {
     let _guard = StateGuard::new();
 

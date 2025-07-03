@@ -167,7 +167,7 @@ impl<T> BytesInUseTracker<T> {
     }
 
     /// Resets the peak of all threads.
-    pub fn reset(&mut self) -> SharedData {
+    pub fn reset(&self) -> SharedData {
         global_reset()
     }
 }

@@ -298,6 +298,11 @@ impl<T> FlameAlloc<T> {
         &self.inner
     }
 
+    /// Returns a mutable reference to the wrapped allocator.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
     /// Returns the data for number of alloc calls.
     pub fn alloc_calls(&self) -> AllocCallsFlameGraph {
         global_alloc_calls()

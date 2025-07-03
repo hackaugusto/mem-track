@@ -9,7 +9,7 @@ use std::{
     mem,
     sync::{
         LazyLock, RwLock, RwLockReadGuard,
-        atomic::{AtomicIsize, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread::{self, ThreadId},
 };
@@ -25,7 +25,7 @@ use crate::guard::StateGuard;
 type SharedData = Vec<CachePadded<BytesInUse>>;
 
 // Type description:
-// - LazyLock: Used to wrap a `SharedDAta` and expose it as a static.
+// - LazyLock: Used to wrap a `SharedData` and expose it as a static.
 // - RwLock: To synchronize collecting the data and updating it.
 static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default());
 
@@ -56,8 +56,10 @@ fn init_bytes() -> RwLockReadGuard<'static, SharedData> {
                 .expect("Should never panic while holding the lock");
 
             let bytes = BytesInUse {
-                in_use: Default::default(),
+                allocated: Default::default(),
+                deallocated: Default::default(),
                 peak: Default::default(),
+                num_alloc_calls: Default::default(),
                 thread_id: thread::current().id(),
             };
             let pos = lock.len();
@@ -111,22 +113,32 @@ pub fn thread_reset_peak() {
 
     let lock = init_bytes();
     let bytes = &lock[CACHED_POSITION.get()];
-    let in_use = bytes.in_use.load(Ordering::Relaxed);
-    let in_use = usize::try_from(in_use).unwrap_or(0);
-    bytes.peak.store(in_use, Ordering::Relaxed);
+    let allocated = bytes.allocated.load(Ordering::Relaxed);
+    let deallocated = bytes.deallocated.load(Ordering::Relaxed);
+    let peak = allocated.saturating_sub(deallocated);
+    bytes.peak.store(peak, Ordering::Relaxed);
 }
 
 pub struct BytesInUse {
-    /// Current number of bytes in use.
+    /// Current number of bytes allocated.
     ///
-    /// Will be lower than peak after a deallocation.
-    /// May be negative when a type is Send and deallocated on a different thread.
-    pub in_use: AtomicIsize,
+    /// Can be smaller than deallocated if the thread drops Send objects it did
+    /// not allocate.
+    pub allocated: AtomicUsize,
+
+    /// Current number of bytes deallocated.
+    ///
+    /// Can be greater than allocated if the thread drops Send objects it did
+    /// not allocate.
+    pub deallocated: AtomicUsize,
 
     /// Current high water mark.
     ///
     /// Can be re-set.
     pub peak: AtomicUsize,
+
+    /// Number of alloc calls.
+    pub num_alloc_calls: AtomicUsize,
 
     /// The thread to which this data corresponds to.
     thread_id: ThreadId,
@@ -178,18 +190,15 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
 
         if !ret.is_null() {
             if let Some(_guard) = StateGuard::track() {
-                let size = layout
-                    .size()
-                    .try_into()
-                    .expect("allocation should fit in a isize");
-
                 let lock = init_bytes();
                 let bytes = &lock[CACHED_POSITION.get()];
 
-                let old_allocated = bytes.in_use.fetch_add(size, Ordering::Relaxed);
+                let size = layout.size();
+                let old_allocated = bytes.allocated.fetch_add(size, Ordering::Relaxed);
                 // It's okay to add without synchronization because this thread is the only one changing the value
                 let new_allocated = usize::try_from(old_allocated + size).unwrap_or(0);
                 bytes.peak.fetch_max(new_allocated, Ordering::Relaxed);
+                bytes.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
             }
         }
         ret
@@ -200,15 +209,12 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
             self.inner.dealloc(ptr, layout);
         }
         if let Some(_guard) = StateGuard::track() {
-            let size = layout
-                .size()
-                .try_into()
-                .expect("allocation should fit in a isize");
-
             let lock = init_bytes();
             let bytes = &lock[CACHED_POSITION.get()];
 
-            bytes.in_use.fetch_sub(size, Ordering::Relaxed);
+            bytes
+                .deallocated
+                .fetch_add(layout.size(), Ordering::Relaxed);
         }
     }
 }

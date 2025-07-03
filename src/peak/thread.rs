@@ -71,6 +71,8 @@ fn init_thread_data() -> ThreadDataRef {
 /// This does not take into account padding added by the underlying allocator,
 /// it only accounts for the memory requested and used by the application.
 pub fn global_in_use() -> usize {
+    let _guard = StateGuard::new();
+
     #[derive(Default)]
     struct Alloc {
         allocated: usize,

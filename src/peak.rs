@@ -36,6 +36,8 @@ type SharedData = Vec<ThreadDataRef>;
 // - RwLock: To synchronize collecting the data and updating it.
 static THREADS: LazyLock<RwLock<SharedData>> = LazyLock::new(|| Default::default());
 
+static GLOBAL_PEAK: AtomicUsize = AtomicUsize::new(0);
+
 // NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
 thread_local! {
     // Cache for the position of [BytesInUse] in the global array.
@@ -68,13 +70,29 @@ fn init_thread_data() -> ThreadDataRef {
 
 /// Returns the peak bytes usage for the whole program.
 pub fn global_peak() -> usize {
-    let _guard = StateGuard::new();
+    GLOBAL_PEAK.load(Ordering::Relaxed)
+}
+
+/// Resets the global peak.
+pub fn global_reset() {
+    #[derive(Default)]
+    struct Alloc {
+        allocated: usize,
+        deallocated: usize,
+    }
 
     let threads = THREADS
         .read()
         .expect("Should never panic while holding the lock");
 
-    threads.iter().map(|v| v.peak.load(Ordering::Relaxed)).sum()
+    let alloc = threads.iter().fold(Alloc::default(), |mut state, metrics| {
+        state.allocated += metrics.allocated.load(Ordering::Relaxed);
+        state.deallocated += metrics.deallocated.load(Ordering::Relaxed);
+        state
+    });
+
+    let peak = alloc.allocated - alloc.deallocated;
+    GLOBAL_PEAK.store(peak, Ordering::Relaxed);
 }
 
 fn reset_peak(thread_data: ThreadDataRef) {
@@ -85,7 +103,7 @@ fn reset_peak(thread_data: ThreadDataRef) {
 }
 
 /// Resets the peak for all threads.
-pub fn global_reset() -> Vec<BytesInUse> {
+pub fn reset_all_threads() -> Vec<BytesInUse> {
     let _guard = StateGuard::new();
 
     let threads = THREADS
@@ -205,9 +223,10 @@ impl<T> BytesInUseTracker<T> {
         global_peak()
     }
 
-    /// Resets the peak of all threads.
+    /// Resets the global and of all threads peaks.
     pub fn reset(&self) -> Vec<BytesInUse> {
-        global_reset()
+        global_reset();
+        reset_all_threads()
     }
 }
 
@@ -223,6 +242,7 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
                 thread_data.allocated.fetch_add(size, Ordering::Relaxed);
                 thread_data.peak.fetch_add(size, Ordering::Relaxed);
                 thread_data.num_alloc_calls.fetch_add(1, Ordering::Relaxed);
+                GLOBAL_PEAK.fetch_add(size, Ordering::Relaxed);
             }
         }
         ret
@@ -238,6 +258,7 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for BytesInUseTracker<T> {
             let size = layout.size();
             thread_data.deallocated.fetch_add(size, Ordering::Relaxed);
             thread_data.peak.fetch_sub(size, Ordering::Relaxed);
+            GLOBAL_PEAK.fetch_sub(size, Ordering::Relaxed);
         }
     }
 }

@@ -49,7 +49,7 @@ pub fn deallocated() -> usize {
 }
 
 /// Resets the global peak to the current memory in use.
-pub fn reset() {
+pub fn reset_peak() {
     GLOBAL_PEAK.store(in_use(), Ordering::Relaxed);
 }
 
@@ -74,8 +74,8 @@ impl<T> GlobalPeakTracker<T> {
     }
 
     /// Resets the global peak.
-    pub fn reset(&self) {
-        reset()
+    pub fn reset_peak(&self) {
+        reset_peak()
     }
 
     /// Returns the peak memory usage.

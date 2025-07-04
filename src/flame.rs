@@ -104,17 +104,16 @@ fn format_entry(
     backtrace: &'static Backtrace,
     metric: usize,
 ) -> std::fmt::Result {
-    for frame in backtrace.frames().iter().rev() {
-        let mut symbols = frame.symbols().iter();
+    let all_frames = backtrace.frames().iter().rev();
+    let mut all_symbols = all_frames.flat_map(|frame| frame.symbols().iter());
 
-        if let Some(symbol) = symbols.next() {
-            f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
-        }
+    if let Some(symbol) = all_symbols.next() {
+        f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
+    }
 
-        for symbol in symbols {
-            f.write_str(";")?;
-            f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
-        }
+    for symbol in all_symbols {
+        f.write_str(";")?;
+        f.write_fmt(format_args!("{}", symbol_to_name(symbol)))?;
     }
     f.write_str(" ")?;
     f.write_fmt(format_args!("{}", metric))

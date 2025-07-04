@@ -26,7 +26,7 @@ pub fn peak() -> usize {
 /// This does not take into account padding added by the underlying allocator,
 /// it only accounts for the memory requested and used by the application.
 pub fn in_use() -> usize {
-    // Saturaing sub because this read is racing with the alloc/dealloc calls
+    // Saturating sub because this read is racing with the alloc/dealloc calls
     allocated().saturating_sub(deallocated())
 }
 

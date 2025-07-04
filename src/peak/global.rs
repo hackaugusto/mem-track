@@ -84,17 +84,17 @@ impl<T> GlobalPeakTracker<T> {
     }
 
     /// Returns the current number of alloc calls.
-    pub fn alloc_calls() -> usize {
+    pub fn alloc_calls(&self) -> usize {
         alloc_calls()
     }
 
     /// Returns the current number of bytes allocated.
-    pub fn allocated() -> usize {
+    pub fn allocated(&self) -> usize {
         allocated()
     }
 
     /// Returns the current number of bytes deallocated.
-    pub fn deallocated() -> usize {
+    pub fn deallocated(&self) -> usize {
         deallocated()
     }
 

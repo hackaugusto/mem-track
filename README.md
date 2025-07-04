@@ -44,7 +44,7 @@ CPU focused:
 - [measureme](https://lib.rs/crates/measureme) cpu / instruction count focused.
 - [coz](https://github.com/plasma-umass/coz) throughput / latency focused.
 - [samply](https://github.com/mstange/samply) sampling flame graph integrated with https://profiler.firefox.com.
-- [pprof-rs](https://github.com/tikv/pprof-rs) smapling cpu profiler.
+- [pprof-rs](https://github.com/tikv/pprof-rs) sampling cpu profiler.
 
 Other tools:
 

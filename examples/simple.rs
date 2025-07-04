@@ -32,7 +32,7 @@ fn main() {
         sleep(Duration::from_millis(1_000));
 
         if i % 10 == 1 {
-            println!("{}", ALLOCATOR.bytes_allocated());
+            println!("{}", ALLOCATOR.flame_graphs().0);
         }
     }
 }

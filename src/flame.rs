@@ -2,13 +2,14 @@ use std::{
     alloc::{GlobalAlloc, Layout},
     cell::Cell,
     collections::{BTreeMap, btree_map::Entry},
+    env,
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
     mem,
     ops::DerefMut,
     sync::{
         LazyLock, Mutex, MutexGuard, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -37,6 +38,15 @@ type Metrics = Vec<(&'static Backtrace, usize)>;
 // - Vec: Each entry corresponds to one thread state.
 // - ThreadDataRef: A single thread flame graph.
 static THREADS: LazyLock<RwLock<Vec<ThreadDataRef>>> = LazyLock::new(|| Default::default());
+
+// Used to enable/disable flame graph generation at runtime.
+static ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
+    let initial = env::var("FLAMEGRAPH")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    AtomicBool::new(initial)
+});
 
 static BACKTRACE_CACHE: LazyLock<Mutex<BTreeMap<BacktraceId, &'static Backtrace>>> =
     LazyLock::new(|| Default::default());
@@ -212,6 +222,18 @@ where
     result.into_values().collect()
 }
 
+/// Enables flame graph collection
+pub fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Disables flame graph collection and return existing graphs.
+pub fn disable() -> (AllocCallsFlameGraph, BytesAllocatedFlameGraph) {
+    ENABLED.store(false, Ordering::Relaxed);
+
+    flame_graphs()
+}
+
 /// Extract global metric data to generate a flame graph for the number of [GlobalAlloc::alloc] calls.
 pub fn flame_graphs() -> (AllocCallsFlameGraph, BytesAllocatedFlameGraph) {
     let _guard = StateGuard::new();
@@ -271,6 +293,16 @@ impl<T> FlameAlloc<T> {
         flame_graphs()
     }
 
+    /// Enables flame graph collection
+    pub fn enable(&self) {
+        enable()
+    }
+
+    /// Disables flame graph collection and return existing graphs.
+    pub fn disable(&self) -> (AllocCallsFlameGraph, BytesAllocatedFlameGraph) {
+        disable()
+    }
+
     /// Empties the cache of resolved backtraces.
     pub fn empty_backtrace_cache(&self) {
         let empty = Default::default();
@@ -286,17 +318,19 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for FlameAlloc<T> {
         let ret = unsafe { self.inner.alloc(layout) };
         if !ret.is_null() {
             if let Some(_guard) = StateGuard::track() {
-                let backtrace = Backtrace::new_unresolved();
-                let id = BacktraceId::from(&backtrace);
+                if ENABLED.load(Ordering::Relaxed) {
+                    let backtrace = Backtrace::new_unresolved();
+                    let id = BacktraceId::from(&backtrace);
 
-                let mut flame_graph = init_thread_data();
-                let allocation_site = flame_graph
-                    .entry(id)
-                    .or_insert(AllocationSite::with_backtrace(backtrace));
-                allocation_site.alloc_calls.fetch_add(1, Ordering::Relaxed);
-                allocation_site
-                    .bytes_allocated
-                    .fetch_add(layout.size(), Ordering::Relaxed);
+                    let mut flame_graph = init_thread_data();
+                    let allocation_site = flame_graph
+                        .entry(id)
+                        .or_insert(AllocationSite::with_backtrace(backtrace));
+                    allocation_site.alloc_calls.fetch_add(1, Ordering::Relaxed);
+                    allocation_site
+                        .bytes_allocated
+                        .fetch_add(layout.size(), Ordering::Relaxed);
+                }
             }
         }
         ret

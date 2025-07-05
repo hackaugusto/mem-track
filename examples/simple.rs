@@ -1,10 +1,11 @@
 use std::{
     alloc::System,
+    io::{self, Write},
     thread::{self, sleep},
     time::Duration,
 };
 
-use mem_track::flame::FlameAlloc;
+use mem_track::flame::{FlameAlloc, format_flame_graph};
 
 #[global_allocator]
 static ALLOCATOR: FlameAlloc<System> = FlameAlloc::init(System);
@@ -32,7 +33,11 @@ fn main() {
         sleep(Duration::from_millis(1_000));
 
         if i % 10 == 1 {
-            println!("{}", ALLOCATOR.flame_graphs().0);
+            let flamegraph = ALLOCATOR.global_flame_graph();
+            let mut stdout = io::stdout().lock();
+            format_flame_graph(&mut stdout, flamegraph.iter(), |v| v.alloc_calls).unwrap();
+            stdout.flush().unwrap();
+            return;
         }
     }
 }

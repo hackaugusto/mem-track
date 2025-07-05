@@ -50,3 +50,13 @@ Other tools:
 
 - [tracy](https://github.com/wolfpld/tracy) + [rust_tracy_client](https://github.com/nagisa/rust_tracy_client),
   visualization tool, requires collectors.
+
+Unwind libraries:
+
+- [mini-backtrace](https://crates.io/crates/mini-backtrace), wraps llvm-libunwind and allows to recover the instruction pointers.
+  need additional work to retrieve the function names [needs to configure include paths to find headers]
+- [framehop](https://crates.io/crates/framehop) library used by samply.
+- [unwind](https://crates.io/crates/unwind) wrapper around gnu's libunwind [needs libunwind-generic dependency].
+- [libunwind-rs](https://crates.io/crates/libunwind-rs) another wraper around gnu's libunwind.
+- [unwinding](https://crates.io/crates/unwinding) implements stack unwind, doesnt seem to be useful for inspection [compilation error, missing mod].
+- [vex-libunwind](https://crates.io/crates/vex-libunwind), lack safe api for get_proc_info [compilation errors with constants]

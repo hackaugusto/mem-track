@@ -29,8 +29,6 @@ type ThreadDataRef = &'static Mutex<AllocationData>;
 type AllocationData = BTreeMap<BacktraceId, AllocationSite>;
 
 // A flame graph maps a stack trace to a counter / metrics.
-//
-// The is the result of hashing the actual backtrace.
 type FlameGraph = Vec<(Backtrace, Metrics)>;
 
 // Type used to defined a backtrace

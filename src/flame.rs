@@ -8,7 +8,7 @@ use std::{
     ops::DerefMut,
     sync::{
         LazyLock, Mutex, MutexGuard, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -103,10 +103,10 @@ impl From<&[usize]> for BacktraceId {
 #[derive(Debug)]
 struct AllocationSite {
     /// Number of allocations done at this call site.
-    alloc_calls: AtomicUsize,
+    alloc_calls: usize,
 
     /// Number of bytes allocated at this call site.
-    bytes_allocated: AtomicUsize,
+    bytes_allocated: usize,
 
     /// The corresponding [Backtrace] for this site.
     backtrace: ArrayVec<usize, 64>,
@@ -125,8 +125,8 @@ impl AllocationSite {
     /// Creates a new [AllocationSite] with the given [Backtrace].
     fn with_backtrace(backtrace: ArrayVec<usize, 64>) -> AllocationSite {
         AllocationSite {
-            alloc_calls: AtomicUsize::default(),
-            bytes_allocated: AtomicUsize::default(),
+            alloc_calls: 0,
+            bytes_allocated: 0,
             backtrace,
         }
     }
@@ -144,12 +144,10 @@ fn global_extract_flame_data(mut data: Vec<AllocationData>) -> FlameGraph {
                 }
                 Entry::Occupied(occupied_entry) => {
                     let inner = occupied_entry.into_mut();
-                    let alloc_calls = value.alloc_calls.load(Ordering::Relaxed);
-                    let bytes_allocated = value.bytes_allocated.load(Ordering::Relaxed);
-                    inner.alloc_calls.fetch_add(alloc_calls, Ordering::Relaxed);
-                    inner
-                        .bytes_allocated
-                        .fetch_add(bytes_allocated, Ordering::Relaxed);
+                    let alloc_calls = value.alloc_calls;
+                    let bytes_allocated = value.bytes_allocated;
+                    inner.alloc_calls += alloc_calls;
+                    inner.bytes_allocated += bytes_allocated;
                 }
             };
         }
@@ -158,8 +156,8 @@ fn global_extract_flame_data(mut data: Vec<AllocationData>) -> FlameGraph {
         .into_iter()
         .map(|(_key, value)| {
             let metrics = Metrics {
-                alloc_calls: value.alloc_calls.load(Ordering::Relaxed),
-                bytes_allocated: value.bytes_allocated.load(Ordering::Relaxed),
+                alloc_calls: value.alloc_calls,
+                bytes_allocated: value.bytes_allocated,
             };
 
             (value.backtrace, metrics)
@@ -421,10 +419,8 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for FlameAlloc<T> {
                     let allocation_site = flame_graph
                         .entry(id)
                         .or_insert(AllocationSite::with_backtrace(backtrace));
-                    allocation_site.alloc_calls.fetch_add(1, Ordering::Relaxed);
-                    allocation_site
-                        .bytes_allocated
-                        .fetch_add(layout.size(), Ordering::Relaxed);
+                    allocation_site.alloc_calls += 1;
+                    allocation_site.bytes_allocated += layout.size();
                 }
             }
         }

@@ -365,8 +365,7 @@ fn resolve_and_write_frame(
 }
 
 /// Resolve and write the backtrace to the formatter
-fn write_backtrace(f: &mut impl io::Write, trace: &Backtrace) -> io::Result<()> {
-    let details = get_loaders();
+fn write_backtrace(details: &Details, f: &mut impl io::Write, trace: &Backtrace) -> io::Result<()> {
     let mut iter = trace.iter();
 
     if let Some(avma) = iter.next() {
@@ -391,15 +390,16 @@ where
     D: DoubleEndedIterator<Item = &'a (Backtrace, Metrics)>,
     F: Fn(&Metrics) -> usize,
 {
+    let details = get_loaders();
     let last = flamegraph.next_back();
 
     for (backtrace, metrics) in flamegraph {
-        write_backtrace(f, &backtrace)?;
+        write_backtrace(&details, f, &backtrace)?;
         write!(f, " {}\n", metric(&metrics))?;
     }
 
     if let Some((backtrace, metrics)) = last {
-        write_backtrace(f, &backtrace)?;
+        write_backtrace(&details, f, &backtrace)?;
         write!(f, " {}", metric(&metrics))?;
     }
 

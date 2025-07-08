@@ -163,6 +163,11 @@ fn global_extract_flame_data(mut data: Vec<AllocationData>) -> FlameGraph {
         .collect()
 }
 
+/// Checks if the flame graph generation is enabled.
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// Enables flame graph collection
 pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
@@ -223,6 +228,11 @@ impl<T> FlameAlloc<T> {
     /// Reset the flame graph data and return the corresponding graphs.
     pub fn global_flame_graph(&self) -> FlameGraph {
         global_flame_graph()
+    }
+
+    /// Checks if the flame graph generation is enabled.
+    pub fn is_enabled(&self) -> bool {
+        is_enabled()
     }
 
     /// Enables flame graph collection

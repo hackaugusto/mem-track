@@ -142,10 +142,8 @@ fn global_extract_flame_data(mut data: Vec<AllocationData>) -> FlameGraph {
                 }
                 Entry::Occupied(occupied_entry) => {
                     let inner = occupied_entry.into_mut();
-                    let alloc_calls = value.alloc_calls;
-                    let bytes_allocated = value.bytes_allocated;
-                    inner.alloc_calls += alloc_calls;
-                    inner.bytes_allocated += bytes_allocated;
+                    inner.alloc_calls += value.alloc_calls;
+                    inner.bytes_allocated += value.bytes_allocated;
                 }
             };
         }
@@ -337,7 +335,7 @@ fn resolve_and_write_frame(
     let mut frames = match loader.loader.find_frames(svma) {
         Ok(frames) => frames,
         Err(_err) => {
-            write!(f, "{:#}", avma)?;
+            write!(f, "{:#}", svma)?;
             return Ok(());
         }
     };
@@ -345,10 +343,10 @@ fn resolve_and_write_frame(
     match frames.next() {
         Ok(Some(frame)) => write_frame(f, frame, &loader.loader, svma)?,
         Ok(None) => {
-            write!(f, "{:#}", avma)?;
+            write!(f, "{:#}", svma)?;
             return Ok(());
         }
-        Err(_err) => write!(f, "{:#}", avma)?,
+        Err(_err) => write!(f, "{:#}", svma)?,
     }
 
     loop {

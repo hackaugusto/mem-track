@@ -89,7 +89,7 @@ pub fn global_in_use() -> usize {
         state
     });
 
-    alloc.allocated - alloc.deallocated
+    alloc.allocated.saturating_sub(alloc.deallocated)
 }
 
 /// Resets the thread peak to its current memory saturating to zero.

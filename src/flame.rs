@@ -1,5 +1,6 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
+    borrow::Cow,
     cell::Cell,
     collections::{BTreeMap, btree_map::Entry},
     env,
@@ -254,7 +255,10 @@ struct LoaderDetails {
 
 struct SegmentDetails {
     /// The actual virtual memory address of this segment
-    avma: usize,
+    avma_start: usize,
+
+    /// The avma end of this segment
+    avma_end: usize,
 
     /// The idx of its corresponding loader
     loader: usize,
@@ -278,16 +282,19 @@ fn get_loaders() -> Details {
             });
 
             for segment in shlib.segments().filter(|s| s.is_code()) {
-                let avma = segment.actual_virtual_memory_address(shlib);
+                let avma_start = usize::from(segment.actual_virtual_memory_address(shlib));
+                let avma_end = avma_start + segment.len();
+
                 segments.push(SegmentDetails {
-                    avma: avma.into(),
+                    avma_start,
+                    avma_end,
                     loader: loader_pos,
                 });
             }
         }
         Err(_err) => {}
     });
-    segments.sort_by_key(|seg| seg.avma);
+    segments.sort_by_key(|seg| seg.avma_start);
 
     Details { loaders, segments }
 }
@@ -325,11 +332,22 @@ fn resolve_and_write_frame(
     avma: usize,
     details: &Details,
 ) -> io::Result<()> {
-    let segment = match details.segments.binary_search_by_key(&avma, |seg| seg.avma) {
+    let segment = match details
+        .segments
+        .binary_search_by_key(&avma, |seg| seg.avma_start)
+    {
         Ok(v) => v,
         Err(v) => v - 1,
     };
-    let loader = &details.loaders[details.segments[segment].loader];
+    let segment = &details.segments[segment];
+
+    // The address is not contained in any of the known segments.
+    if avma > segment.avma_end {
+        write!(f, "{:#}", avma)?;
+        return Ok(());
+    }
+
+    let loader = &details.loaders[segment.loader];
 
     let svma = u64::try_from(avma.wrapping_sub(loader.bias.0)).unwrap();
     let mut frames = match loader.loader.find_frames(svma) {
@@ -343,7 +361,17 @@ fn resolve_and_write_frame(
     match frames.next() {
         Ok(Some(frame)) => write_frame(f, frame, &loader.loader, svma)?,
         Ok(None) => {
-            write!(f, "{:#}", svma)?;
+            // If no frame was found, fallback to resolving the symbol
+            let symbol = loader
+                .loader
+                .find_symbol(svma.try_into().unwrap())
+                .map(|v| addr2line::demangle_auto(Cow::Borrowed(v), None));
+
+            if let Some(symbol) = symbol {
+                write!(f, "{:#}", symbol)?;
+            } else {
+                write!(f, "{:#}", svma)?;
+            }
             return Ok(());
         }
         Err(_err) => write!(f, "{:#}", svma)?,

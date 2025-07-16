@@ -122,6 +122,11 @@ impl<T> GlobalPeakTracker<T> {
     pub fn in_use(&self) -> usize {
         in_use()
     }
+
+    /// Collect memory metrics for the process and from the allocator.
+    pub fn metrics(&self) -> MemoryMetrics {
+        metrics()
+    }
 }
 
 unsafe impl<T: GlobalAlloc> GlobalAlloc for GlobalPeakTracker<T> {

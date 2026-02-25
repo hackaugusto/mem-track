@@ -2,14 +2,14 @@ use std::{
     alloc::{GlobalAlloc, Layout},
     borrow::Cow,
     cell::Cell,
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{btree_map::Entry, hash_map, BTreeMap, HashMap},
     env,
     hash::{DefaultHasher, Hash, Hasher},
     io, mem,
     ops::DerefMut,
     sync::{
-        LazyLock, Mutex, MutexGuard, RwLock,
         atomic::{AtomicBool, Ordering},
+        LazyLock, Mutex, MutexGuard, RwLock,
     },
 };
 
@@ -299,39 +299,37 @@ fn get_loaders() -> Details {
     Details { loaders, segments }
 }
 
-/// Writes the frame name to the formatter `f`.
-fn write_frame<R: Reader>(
-    f: &mut impl io::Write,
-    frame: Frame<'_, R>,
-    loader: &Loader,
-    svma: u64,
-) -> io::Result<()> {
-    match frame.function {
+/// Returns a reference to the frame's name.
+fn frame_to_symbol<'frame, R: Reader>(frame: &'frame Frame<'_, R>) -> Cow<'frame, str> {
+    match frame.function.as_ref() {
         Some(function) => match function.demangle() {
-            Ok(name) => {
-                write!(f, "{}", name)
-            }
+            // symbol lifetime is bound to the frame, which is a stack variable in the caller
+            Ok(symbol) => symbol,
             Err(_err) => match function.raw_name() {
-                Ok(name) => write!(f, "{}", name),
-                Err(_err) => write!(f, "{}", UNKNOWN),
+                Ok(symbol) => symbol,
+                Err(_err) => Cow::Borrowed(UNKNOWN),
             },
         },
-        None => match loader.find_symbol(svma) {
-            Some(symbol) => write!(f, "{}", symbol),
-            None => write!(f, "{}", UNKNOWN),
-        },
+        None => Cow::Borrowed(UNKNOWN),
     }
 }
 
-/// Writes the function names corresponding to the instruction pointer.
+/// Resolve the function names corresponding to the instruction pointer.
 ///
 /// Given an advertised virtual memory address and debug info loaders this function
 /// resolves the names corresponding to the `avma` and write it to `f`.
-fn resolve_and_write_frame(
-    f: &mut impl io::Write,
-    avma: usize,
-    details: &Details,
-) -> io::Result<()> {
+///
+/// NOTE: A single `avma` address may correspond to multiple frames due to inlining,
+/// this function will return a `;` string with the frame names in that case.
+fn resolve_frame(avma: usize, details: &Details) -> Cow<'static, str> {
+    // This function returns a Cow because:
+    //
+    // - It wont need to allocate when the symbol is unknown
+    // - It can reuse allocations from demangled symbols
+    //
+    // Unfortunately this can't reference the DWARF symbols directly, since the
+    // available APIs seem to borrow from local variables.
+
     let segment = match details
         .segments
         .binary_search_by_key(&avma, |seg| seg.avma_start)
@@ -343,8 +341,7 @@ fn resolve_and_write_frame(
 
     // The address is not contained in any of the known segments.
     if avma > segment.avma_end {
-        write!(f, "{:#}", avma)?;
-        return Ok(());
+        return Cow::Borrowed(UNKNOWN);
     }
 
     let loader = &details.loaders[segment.loader];
@@ -353,54 +350,92 @@ fn resolve_and_write_frame(
     let mut frames = match loader.loader.find_frames(svma) {
         Ok(frames) => frames,
         Err(_err) => {
-            write!(f, "{:#}", svma)?;
-            return Ok(());
+            return Cow::Owned(format!("{:#}", svma));
         }
     };
 
-    match frames.next() {
-        Ok(Some(frame)) => write_frame(f, frame, &loader.loader, svma)?,
-        Ok(None) => {
-            // If no frame was found, fallback to resolving the symbol
-            let symbol = loader
-                .loader
-                .find_symbol(svma.try_into().unwrap())
-                .map(|v| addr2line::demangle_auto(Cow::Borrowed(v), None));
-
-            if let Some(symbol) = symbol {
-                write!(f, "{:#}", symbol)?;
-            } else {
-                write!(f, "{:#}", svma)?;
-            }
-            return Ok(());
-        }
-        Err(_err) => write!(f, "{:#}", svma)?,
-    }
-
+    let mut resolved = Vec::with_capacity(8);
     loop {
-        write!(f, ";")?;
-
         match frames.next() {
-            Ok(Some(frame)) => write_frame(f, frame, &loader.loader, svma)?,
-            Ok(None) => break,
-            Err(_err) => write!(f, "{}", UNKNOWN)?,
+            Ok(Some(frame)) => {
+                resolved.push(frame);
+            }
+            Ok(None) => {
+                if resolved.is_empty() {
+                    // If no frame was found, fallback to resolving the symbol
+                    let symbol = loader
+                        .loader
+                        .find_symbol(svma)
+                        .map(|v| addr2line::demangle_auto(Cow::Borrowed(v), None));
+
+                    if let Some(symbol) = symbol {
+                        // symbol lifetime is bound to the loader, reuse
+                        // allocation if demangling was performed
+                        return Cow::Owned(symbol.into_owned());
+                    } else {
+                        return Cow::Borrowed(UNKNOWN);
+                    }
+                }
+                break;
+            }
+            Err(_err) => {
+                return Cow::Borrowed(UNKNOWN);
+            }
         }
     }
 
-    Ok(())
+    if resolved.len() == 0 {
+        // This shouldn't happen, the iterator would have returned Ok(None) and
+        // it would be handled above.
+        return Cow::Borrowed(UNKNOWN);
+    } else if resolved.len() == 1 {
+        let frame = resolved.pop().unwrap();
+        Cow::Owned(frame_to_symbol(&frame).into_owned())
+    } else {
+        let mut iter = resolved.iter();
+        let frame = iter.next().unwrap(); // length checked above
+        let mut result = frame_to_symbol(frame).into_owned();
+        for frame in iter {
+            result.push_str(";");
+            result.push_str(frame_to_symbol(frame).as_ref());
+        }
+        Cow::Owned(result)
+    }
 }
 
 /// Resolve and write the backtrace to the formatter
-fn write_backtrace(details: &Details, f: &mut impl io::Write, trace: &Backtrace) -> io::Result<()> {
+fn write_backtrace(
+    details: &Details,
+    f: &mut impl io::Write,
+    trace: &Backtrace,
+    symbols_cache: &mut HashMap<usize, Cow<'static, str>>,
+) -> io::Result<()> {
     let mut iter = trace.iter();
 
     if let Some(avma) = iter.next() {
-        resolve_and_write_frame(f, *avma, &details)?;
+        match symbols_cache.entry(*avma) {
+            hash_map::Entry::Occupied(occupied_entry) => {
+                write!(f, "{}", occupied_entry.get().as_ref())?;
+            }
+            hash_map::Entry::Vacant(vacant_entry) => {
+                let symbols = resolve_frame(*avma, &details);
+                write!(f, "{}", symbols.as_ref())?;
+                vacant_entry.insert(symbols);
+            }
+        }
     }
 
     for avma in iter {
-        write!(f, ";")?;
-        resolve_and_write_frame(f, *avma, &details)?;
+        match symbols_cache.entry(*avma) {
+            hash_map::Entry::Occupied(occupied_entry) => {
+                write!(f, ";{}", occupied_entry.get().as_ref())?;
+            }
+            hash_map::Entry::Vacant(vacant_entry) => {
+                let symbols = resolve_frame(*avma, &details);
+                write!(f, ";{}", symbols.as_ref())?;
+                vacant_entry.insert(symbols);
+            }
+        }
     }
 
     Ok(())
@@ -418,14 +453,15 @@ where
 {
     let details = get_loaders();
     let last = flamegraph.next_back();
+    let mut symbols_cache = HashMap::new();
 
     for (backtrace, metrics) in flamegraph {
-        write_backtrace(&details, f, &backtrace)?;
+        write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
         write!(f, " {}\n", metric(&metrics))?;
     }
 
     if let Some((backtrace, metrics)) = last {
-        write_backtrace(&details, f, &backtrace)?;
+        write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
         write!(f, " {}", metric(&metrics))?;
     }
 

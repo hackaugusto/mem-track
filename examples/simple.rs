@@ -27,17 +27,11 @@ fn main() {
         handles.push(handle);
     }
 
-    let mut i = 0;
-    loop {
-        i += 1;
-        sleep(Duration::from_millis(1_000));
+    sleep(Duration::from_millis(1_000));
 
-        if i % 10 == 1 {
-            let flamegraph = ALLOCATOR.global_flame_graph();
-            let mut stdout = io::stdout().lock();
-            format_flame_graph(&mut stdout, flamegraph.iter(), |v| v.alloc_calls).unwrap();
-            stdout.flush().unwrap();
-            return;
-        }
-    }
+    let flamegraph = ALLOCATOR.global_flame_graph();
+    let mut stdout = io::stdout().lock();
+    format_flame_graph(&mut stdout, flamegraph.iter(), |v| v.alloc_calls).unwrap();
+    stdout.flush().unwrap();
+    return;
 }

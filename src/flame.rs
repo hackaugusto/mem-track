@@ -2,14 +2,14 @@ use std::{
     alloc::{GlobalAlloc, Layout},
     borrow::Cow,
     cell::Cell,
-    collections::{btree_map::Entry, hash_map, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, btree_map::Entry, hash_map},
     env,
     hash::{DefaultHasher, Hash, Hasher},
     io, mem,
     ops::DerefMut,
     sync::{
-        atomic::{AtomicBool, Ordering},
         LazyLock, Mutex, MutexGuard, RwLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -47,7 +47,7 @@ static THREADS: LazyLock<RwLock<Vec<ThreadDataRef>>> = LazyLock::new(|| Default:
 
 // Used to enable/disable flame graph generation at runtime.
 static ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
-    let initial = env::var("FLAMEGRAPH")
+    let initial = env::var("FLAMEGRAPH_STARTS_ENABLED")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
 
@@ -449,20 +449,24 @@ pub fn format_flame_graph<'a, F, D>(
 ) -> io::Result<()>
 where
     D: DoubleEndedIterator<Item = &'a (Backtrace, Metrics)>,
-    F: Fn(&Metrics) -> usize,
+    F: Fn(&Metrics) -> Option<usize>,
 {
     let details = get_loaders();
     let last = flamegraph.next_back();
     let mut symbols_cache = HashMap::new();
 
     for (backtrace, metrics) in flamegraph {
-        write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
-        write!(f, " {}\n", metric(&metrics))?;
+        if let Some(value) = metric(&metrics) {
+            write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
+            write!(f, " {}\n", value)?;
+        }
     }
 
     if let Some((backtrace, metrics)) = last {
-        write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
-        write!(f, " {}", metric(&metrics))?;
+        if let Some(value) = metric(&metrics) {
+            write_backtrace(&details, f, &backtrace, &mut symbols_cache)?;
+            write!(f, " {}", value)?;
+        }
     }
 
     Ok(())

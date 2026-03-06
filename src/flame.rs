@@ -1,14 +1,12 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
     borrow::Cow,
-    cell::Cell,
     collections::{BTreeMap, HashMap, btree_map::Entry, hash_map},
     env,
     hash::{DefaultHasher, Hash, Hasher},
-    io, mem,
-    ops::DerefMut,
+    io,
     sync::{
-        LazyLock, Mutex, MutexGuard, RwLock,
+        LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -19,12 +17,6 @@ use findshlibs::{Bias, Segment, SharedLibrary, TargetSharedLibrary};
 use gimli::Reader;
 
 use crate::guard::StateGuard;
-
-// Type description:
-// - &'static: The pinned reference to the thread flame data.
-// - Mutex: To allow swap'ing the flame graph data
-// - FlameGraph: The actual data.
-type ThreadDataRef = &'static Mutex<AllocationData>;
 
 // Data tracked to generate the frame graph
 type AllocationData = BTreeMap<BacktraceId, AllocationSite>;
@@ -38,12 +30,29 @@ type Backtrace = ArrayVec<usize, 64>;
 // Value used to represent an unknwon function name
 const UNKNOWN: &str = "??";
 
-// Type description:
-// - LazyLock: To expose the metric data as an static.
-// - RwLock: To synchronize collecting the data and updating it.
-// - Vec: Each entry corresponds to one thread state.
-// - ThreadDataRef: A single thread flame graph.
-static THREADS: LazyLock<RwLock<Vec<ThreadDataRef>>> = LazyLock::new(|| Default::default());
+struct PeakData {
+    active_allocs: HashMap<usize, (usize, BacktraceId)>,
+    current_flame: AllocationData,
+    peak_flame: AllocationData,
+    current_usage: usize,
+    peak_usage: usize,
+    dirty: bool,
+}
+
+impl Default for PeakData {
+    fn default() -> Self {
+        Self {
+            active_allocs: HashMap::default(),
+            current_flame: AllocationData::default(),
+            peak_flame: AllocationData::default(),
+            current_usage: 0,
+            peak_usage: 0,
+            dirty: false,
+        }
+    }
+}
+
+static PEAK_DATA: LazyLock<Mutex<PeakData>> = LazyLock::new(|| Mutex::new(PeakData::default()));
 
 // Used to enable/disable flame graph generation at runtime.
 static ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
@@ -53,37 +62,6 @@ static ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
 
     AtomicBool::new(initial)
 });
-
-// NOTE: The global allocator is not allowed to use an static with a destructor. see rust-lang/rust#126948
-thread_local! {
-    // Cache for the position of [BytesInUse] in the global array.
-    // Cell: Provides interior mutability
-    // Option: Used to identify the initialisation and push the reference to the global THREADS.
-    // ThreadDataRef: The thread data.
-    static CACHED_REF: Cell<Option<ThreadDataRef>> = Cell::new(None);
-}
-
-fn init_thread_data() -> MutexGuard<'static, AllocationData> {
-    loop {
-        match CACHED_REF.get() {
-            Some(data) => {
-                return data
-                    .lock()
-                    .expect("Should never panic while holding the lock");
-            }
-            None => {}
-        };
-
-        let mut lock = THREADS
-            .write()
-            .expect("Should never panic while holding the lock");
-
-        let flame_graph = Box::leak(Box::new(Mutex::new(Default::default())));
-        lock.push(flame_graph);
-
-        CACHED_REF.set(Some(flame_graph));
-    }
-}
 
 /// A wrapper struct to uniquely identify an allocation size.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -99,7 +77,7 @@ impl From<&[usize]> for BacktraceId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AllocationSite {
     /// Number of allocations done at this call site.
     alloc_calls: usize,
@@ -111,7 +89,7 @@ struct AllocationSite {
     backtrace: ArrayVec<usize, 64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metrics {
     /// Number of allocations done at this call site.
     pub alloc_calls: usize,
@@ -131,36 +109,6 @@ impl AllocationSite {
     }
 }
 
-/// Extract global metric data to generate a flame graph.
-fn global_extract_flame_data(mut data: Vec<AllocationData>) -> FlameGraph {
-    let mut result = data.pop().unwrap_or_default();
-
-    for thread in data.into_iter() {
-        for (key, value) in thread.into_iter() {
-            match result.entry(key) {
-                Entry::Vacant(vacant_entry) => {
-                    vacant_entry.insert(value);
-                }
-                Entry::Occupied(occupied_entry) => {
-                    let inner = occupied_entry.into_mut();
-                    inner.alloc_calls += value.alloc_calls;
-                    inner.bytes_allocated += value.bytes_allocated;
-                }
-            };
-        }
-    }
-    result
-        .into_iter()
-        .map(|(_key, value)| {
-            let metrics = Metrics {
-                alloc_calls: value.alloc_calls,
-                bytes_allocated: value.bytes_allocated,
-            };
-
-            (value.backtrace, metrics)
-        })
-        .collect()
-}
 
 /// Checks if the flame graph generation is enabled.
 pub fn is_enabled() -> bool {
@@ -183,25 +131,27 @@ pub fn disable() -> FlameGraph {
 pub fn global_flame_graph() -> FlameGraph {
     let _guard = StateGuard::new();
 
-    let threads = {
-        let threads = THREADS
-            .read()
-            .expect("Should never panic while holding the lock");
+    let data = PEAK_DATA
+        .lock()
+        .expect("Should never panic while holding the lock");
 
-        let mut graphs = Vec::with_capacity(threads.len());
-        graphs.resize_with(threads.len(), || AllocationData::default());
-
-        for (pos, thread) in threads.iter().enumerate() {
-            let mut data = thread
-                .lock()
-                .expect("Should never panic while holding the lock");
-            mem::swap(data.deref_mut(), &mut graphs[pos]);
-        }
-
-        graphs
+    let source = if data.dirty {
+        &data.current_flame
+    } else {
+        &data.peak_flame
     };
 
-    global_extract_flame_data(threads)
+    source
+        .iter()
+        .map(|(_key, value)| {
+            let metrics = Metrics {
+                alloc_calls: value.alloc_calls,
+                bytes_allocated: value.bytes_allocated,
+            };
+
+            (value.backtrace.clone(), metrics)
+        })
+        .collect()
 }
 
 pub struct FlameAlloc<T> {
@@ -489,12 +439,24 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for FlameAlloc<T> {
 
                     let id = BacktraceId::from(backtrace.as_slice());
 
-                    let mut flame_graph = init_thread_data();
-                    let allocation_site = flame_graph
+                    let mut data = PEAK_DATA
+                        .lock()
+                        .expect("Should never panic while holding the lock");
+                    let size = layout.size();
+                    data.active_allocs.insert(ret as usize, (size, id));
+
+                    let allocation_site = data
+                        .current_flame
                         .entry(id)
                         .or_insert(AllocationSite::with_backtrace(backtrace));
                     allocation_site.alloc_calls += 1;
-                    allocation_site.bytes_allocated += layout.size();
+                    allocation_site.bytes_allocated += size;
+
+                    data.current_usage += size;
+                    if data.current_usage > data.peak_usage {
+                        data.peak_usage = data.current_usage;
+                        data.dirty = true;
+                    }
                 }
             }
         }
@@ -502,6 +464,31 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for FlameAlloc<T> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if let Some(_guard) = StateGuard::track() {
+            if ENABLED.load(Ordering::Relaxed) {
+                let mut data = PEAK_DATA
+                    .lock()
+                    .expect("Should never panic while holding the lock");
+
+                if data.dirty {
+                    data.peak_flame = data.current_flame.clone();
+                    data.dirty = false;
+                }
+
+                if let Some((size, id)) = data.active_allocs.remove(&(ptr as usize)) {
+                    data.current_usage -= size;
+                    if let Entry::Occupied(mut entry) = data.current_flame.entry(id) {
+                        let site = entry.get_mut();
+                        site.alloc_calls -= 1;
+                        site.bytes_allocated -= size;
+                        if site.alloc_calls == 0 {
+                            entry.remove();
+                        }
+                    }
+                }
+            }
+        }
+
         unsafe {
             self.inner.dealloc(ptr, layout);
         }

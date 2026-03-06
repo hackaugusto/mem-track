@@ -31,7 +31,7 @@ fn main() {
 
     let flamegraph = ALLOCATOR.global_flame_graph();
     let mut stdout = io::stdout().lock();
-    format_flame_graph(&mut stdout, flamegraph.iter(), |v| v.alloc_calls).unwrap();
+    format_flame_graph(&mut stdout, flamegraph.iter(), |v| Some(v.bytes_allocated)).unwrap();
     stdout.flush().unwrap();
     return;
 }
